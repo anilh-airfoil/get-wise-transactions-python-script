@@ -131,7 +131,7 @@ def pick_business_profile(profiles: list[dict]) -> dict:
             or ""
         )
 
-        if WISE_PROFILE_NAME.lower() in str(name).lower():
+        if WISE_PROFILE_NAME.lower() in name.lower():
             return profile
 
     # Fallback: first business profile
