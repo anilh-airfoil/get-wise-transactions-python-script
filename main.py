@@ -280,23 +280,23 @@ def build_n8n_payload(tx: dict, balance_currency: str, sync_time_iso: str, busin
         fee_value = 0
 
     payload = {
-        "Transaction ID": str(tx_id),
-        "Transfer ID": str(transfer_id) if transfer_id else "",
-        "Status": normalize_status(raw_status),
-        "Transaction Type": normalize_type(raw_type),
-        "Direction": direction,
-        "Amount": amount_abs,
-        "Source Amount": source_amount,
-        "Source Currency": source_currency,
-        "Target Amount": target_amount,
-        "Target Currency": target_currency,
-        "Fee": fee_value,
-        "Sender Name": sender_name,
-        "Recipient Name": recipient_name,
-        "Reference": str(reference),
-        "Receipt URL": "",
-        "Last Synced": sync_time_iso,
-    }
+    "Transaction ID": str(tx_id),
+    "Transfer ID": str(transfer_id) if transfer_id else "",
+    "Status": normalize_status(raw_status),
+    "Transaction Type": normalize_type(raw_type),
+    "Direction": direction,
+    "Amount": amount_abs,
+    "Source Amount": source_amount,
+    "Source Currency": source_currency,
+    "Target Amount": target_amount,
+    "Target Currency": target_currency,
+    "Fee": fee_value,
+    "Sender Name": sender_name,
+    "Recipient Name": recipient_name,
+    "Reference": str(reference),
+    "Receipt URL": "",
+    "Last Synced": sync_time_iso,
+}
 
     return {k: v for k, v in payload.items() if v is not None}
 
