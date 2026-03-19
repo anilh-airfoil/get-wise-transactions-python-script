@@ -101,7 +101,6 @@ def find_first_string(obj, candidate_keys: list[str]) -> str | None:
 
 # ========= WISE API =========
 def get_profiles():
-    # using v2 based on current docs screenshot
     url = "https://api.wise.com/v2/profiles"
     resp = requests.get(url, headers=WISE_HEADERS, timeout=30)
     resp.raise_for_status()
@@ -171,14 +170,22 @@ def extract_transactions(statement_json: dict) -> list[dict]:
 
 # ========= MAPPING =========
 def find_transfer_id(tx: dict) -> str | None:
-    candidate_keys = [
+    direct_keys = [
         "transferId",
         "transfer_id",
         "sourceTransferId",
         "recipientTransferId",
         "originalTransferId",
     ]
-    return find_first_string(tx, candidate_keys)
+    found = find_first_string(tx, direct_keys)
+    if found:
+        return found
+
+    ref = find_first_string(tx, ["referenceNumber", "reference"])
+    if ref and str(ref).upper().startswith("TRANSFER-"):
+        return str(ref)
+
+    return None
 
 def find_sender_name(tx: dict) -> str | None:
     candidate_keys = [
@@ -198,12 +205,80 @@ def find_recipient_name(tx: dict) -> str | None:
         "creditorName",
         "merchantName",
         "counterpartyName",
+        "payeeName",
+        "displayName",
+        "name",
+        "description",
     ]
-    return find_first_string(tx, candidate_keys)
+    found = find_first_string(tx, candidate_keys)
+    if found and not str(found).strip().upper().startswith(("CARD-", "TRANSFER-")):
+        return found
+    return None
+
+def is_transfer_like(tx: dict, raw_type: str | None = None, tx_id: str | None = None, reference: str | None = None) -> bool:
+    type_value = (raw_type or "").lower()
+    if "transfer" in type_value:
+        return True
+
+    if tx_id and str(tx_id).upper().startswith("TRANSFER-"):
+        return True
+
+    if reference and str(reference).upper().startswith("TRANSFER-"):
+        return True
+
+    if find_transfer_id(tx):
+        return True
+
+    return False
+
+def enrich_transfer_details_stub(
+    tx: dict,
+    transfer_id: str | None,
+    recipient_name: str | None,
+    sender_name: str | None,
+    reference: str | None,
+) -> dict:
+    """
+    Phase 1.5 helper:
+    This does not call another Wise endpoint yet.
+    It just centralizes enrichment logic so phase 2 can plug in here later.
+
+    Future phase:
+    - call transfer endpoint
+    - call receipt.pdf endpoint
+    - add confirmation / payout / recipient fields when available
+    """
+    enriched = {
+        "transfer_id": transfer_id or "",
+        "recipient_name": recipient_name or "",
+        "sender_name": sender_name or "",
+        "reference": reference or "",
+        "receipt_url": "",
+    }
+
+    if not enriched["transfer_id"]:
+        ref = find_first_string(tx, ["referenceNumber", "reference"])
+        if ref and str(ref).upper().startswith("TRANSFER-"):
+            enriched["transfer_id"] = str(ref)
+
+    if not enriched["recipient_name"]:
+        alt_name = find_first_string(
+            tx,
+            [
+                "merchantName",
+                "counterpartyName",
+                "payeeName",
+                "displayName",
+            ],
+        )
+        if alt_name and not str(alt_name).strip().upper().startswith(("CARD-", "TRANSFER-")):
+            enriched["recipient_name"] = alt_name
+
+    return enriched
 
 def build_n8n_payload(tx: dict, balance_currency: str, sync_time_iso: str, business_name: str) -> dict | None:
     tx_id = (
-        find_first_string(tx, ["id", "transactionId", "referenceNumber", "reference"])
+        find_first_string(tx, ["referenceNumber", "transactionId", "id", "reference"])
         or None
     )
     if not tx_id:
@@ -230,7 +305,7 @@ def build_n8n_payload(tx: dict, balance_currency: str, sync_time_iso: str, busin
     amount_abs = abs(amount_float)
     direction = normalize_direction(amount_float)
 
-    created_at = (
+    transaction_on = (
         tx.get("date")
         or tx.get("createdAt")
         or tx.get("created_at")
@@ -251,16 +326,32 @@ def build_n8n_payload(tx: dict, balance_currency: str, sync_time_iso: str, busin
         or "completed"
     )
 
-    transfer_id = find_transfer_id(tx)
-    sender_name = find_sender_name(tx) or business_name
-    recipient_name = find_recipient_name(tx) or ""
-
     reference = (
         tx.get("reference")
         or tx.get("referenceNumber")
         or tx.get("description")
         or ""
     )
+
+    transfer_id = find_transfer_id(tx)
+    sender_name = find_sender_name(tx) or business_name
+    recipient_name = find_recipient_name(tx) or ""
+
+    if is_transfer_like(tx, raw_type=raw_type, tx_id=str(tx_id), reference=str(reference)):
+        enriched = enrich_transfer_details_stub(
+            tx=tx,
+            transfer_id=transfer_id,
+            recipient_name=recipient_name,
+            sender_name=sender_name,
+            reference=str(reference),
+        )
+        transfer_id = enriched["transfer_id"]
+        recipient_name = enriched["recipient_name"]
+        sender_name = enriched["sender_name"]
+        reference = enriched["reference"]
+        receipt_url = enriched["receipt_url"]
+    else:
+        receipt_url = ""
 
     source_currency = safe_get(tx, "amount", "currency") or balance_currency
     target_currency = balance_currency
@@ -280,23 +371,24 @@ def build_n8n_payload(tx: dict, balance_currency: str, sync_time_iso: str, busin
         fee_value = 0
 
     payload = {
-    "Transaction ID": str(tx_id),
-    "Transfer ID": str(transfer_id) if transfer_id else "",
-    "Status": normalize_status(raw_status),
-    "Transaction Type": normalize_type(raw_type),
-    "Direction": direction,
-    "Amount": amount_abs,
-    "Source Amount": source_amount,
-    "Source Currency": source_currency,
-    "Target Amount": target_amount,
-    "Target Currency": target_currency,
-    "Fee": fee_value,
-    "Sender Name": sender_name,
-    "Recipient Name": recipient_name,
-    "Reference": str(reference),
-    "Receipt URL": "",
-    "Last Synced": sync_time_iso,
-}
+        "Transaction ID": str(tx_id),
+        "Transfer ID": str(transfer_id) if transfer_id else "",
+        "Transaction On": transaction_on,
+        "Status": normalize_status(raw_status),
+        "Transaction Type": normalize_type(raw_type),
+        "Direction": direction,
+        "Amount": amount_abs,
+        "Source Amount": source_amount,
+        "Source Currency": source_currency,
+        "Target Amount": target_amount,
+        "Target Currency": target_currency,
+        "Fee": fee_value,
+        "Sender Name": sender_name or "",
+        "Recipient Name": recipient_name or "",
+        "Reference": str(reference) if reference else "",
+        "Receipt URL": receipt_url,
+        "Last Synced": sync_time_iso,
+    }
 
     return {k: v for k, v in payload.items() if v is not None}
 
@@ -309,7 +401,6 @@ def send_to_n8n(payload: dict):
     )
     resp.raise_for_status()
 
-    # n8n may return empty or json depending on your response node setup
     if resp.content:
         try:
             return resp.json()
@@ -383,6 +474,14 @@ def main():
             if not payload:
                 skipped_count += 1
                 continue
+
+            if not payload.get("Transfer ID") or not payload.get("Recipient Name"):
+                log(
+                    f"Missing details | TX={payload.get('Transaction ID')} "
+                    f"| Type={payload.get('Transaction Type')} "
+                    f"| Direction={payload.get('Direction')} "
+                    f"| Ref={payload.get('Reference')}"
+                )
 
             try:
                 send_to_n8n(payload)
