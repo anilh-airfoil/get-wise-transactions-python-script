@@ -99,6 +99,45 @@ def find_first_string(obj, candidate_keys: list[str]) -> str | None:
 
     return None
 
+def find_first_money_dict(obj, candidate_keys: list[str]) -> dict | None:
+    """
+    Recursively search for the first dict under one of the candidate keys
+    that looks like: {"value": ..., "currency": ...}
+    """
+    if isinstance(obj, dict):
+        for key in candidate_keys:
+            val = obj.get(key)
+            if isinstance(val, dict) and ("value" in val or "amount" in val) and "currency" in val:
+                return val
+
+        for _, value in obj.items():
+            found = find_first_money_dict(value, candidate_keys)
+            if found:
+                return found
+
+    elif isinstance(obj, list):
+        for item in obj:
+            found = find_first_money_dict(item, candidate_keys)
+            if found:
+                return found
+
+    return None
+
+def parse_money_dict(money_dict: dict | None) -> tuple[float | None, str | None]:
+    if not isinstance(money_dict, dict):
+        return None, None
+
+    raw_value = money_dict.get("value", money_dict.get("amount"))
+    raw_currency = money_dict.get("currency")
+
+    try:
+        value = abs(float(raw_value)) if raw_value is not None else None
+    except Exception:
+        value = None
+
+    currency = str(raw_currency).strip() if raw_currency else None
+    return value, currency
+
 # ========= WISE API =========
 def get_profiles():
     url = "https://api.wise.com/v2/profiles"
@@ -240,13 +279,8 @@ def enrich_transfer_details_stub(
 ) -> dict:
     """
     Phase 1.5 helper:
-    This does not call another Wise endpoint yet.
-    It just centralizes enrichment logic so phase 2 can plug in here later.
-
-    Future phase:
-    - call transfer endpoint
-    - call receipt.pdf endpoint
-    - add confirmation / payout / recipient fields when available
+    No extra Wise API call yet.
+    Just centralizes enrichment logic so phase 2 can plug in here later.
     """
     enriched = {
         "transfer_id": transfer_id or "",
@@ -353,11 +387,31 @@ def build_n8n_payload(tx: dict, balance_currency: str, sync_time_iso: str, busin
     else:
         receipt_url = ""
 
+    # Source side
     source_currency = safe_get(tx, "amount", "currency") or balance_currency
-    target_currency = balance_currency
-
     source_amount = amount_abs
-    target_amount = amount_abs
+
+    # Try to detect target/recipient side separately
+    target_money_dict = find_first_money_dict(
+        tx,
+        [
+            "targetAmount",
+            "recipientAmount",
+            "payoutAmount",
+            "convertedAmount",
+            "destinationAmount",
+            "settlementAmount",
+        ],
+    )
+
+    target_amount, target_currency = parse_money_dict(target_money_dict)
+
+    # Fallback if no separate target amount was found
+    if target_amount is None:
+        target_amount = amount_abs
+
+    if not target_currency:
+        target_currency = balance_currency
 
     fee_value = (
         safe_get(tx, "fee", "value")
@@ -372,7 +426,6 @@ def build_n8n_payload(tx: dict, balance_currency: str, sync_time_iso: str, busin
 
     payload = {
         "Transaction ID": str(tx_id),
-        "Transfer ID": str(transfer_id) if transfer_id else "",
         "Transaction On": transaction_on,
         "Status": normalize_status(raw_status),
         "Transaction Type": normalize_type(raw_type),
@@ -474,6 +527,10 @@ def main():
             if not payload:
                 skipped_count += 1
                 continue
+
+            # Optional debug log for transfer-like rows
+            if str(payload.get("Transaction ID", "")).upper().startswith("TRANSFER-"):
+                log(f"TRANSFER RAW TX: {tx}")
 
             if not payload.get("Transfer ID") or not payload.get("Recipient Name"):
                 log(
