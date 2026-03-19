@@ -146,6 +146,7 @@ def get_balances(profile_id: int):
     resp = requests.get(
         url,
         headers=WISE_HEADERS,
+        params={"types": "STANDARD,SAVINGS"},
         timeout=30,
     )
     resp.raise_for_status()
