@@ -2,22 +2,17 @@ import os
 import sys
 import requests
 from datetime import datetime, timedelta, timezone
-from pyairtable import Api
 
 # ========= ENV VARS =========
 WISE_TOKEN = os.environ.get("WISE_TOKEN")
-AIRTABLE_TOKEN = os.environ.get("AIRTABLE_TOKEN")
-AIRTABLE_BASE_ID = os.environ.get("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE_NAME = os.environ.get("AIRTABLE_TABLE_NAME", "Transactions")
 WISE_PROFILE_NAME = os.environ.get("WISE_PROFILE_NAME", "Airfoil")
 WISE_LOOKBACK_DAYS = int(os.environ.get("WISE_LOOKBACK_DAYS", "30"))
+N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL")
 
 if not WISE_TOKEN:
     raise ValueError("Missing WISE_TOKEN")
-if not AIRTABLE_TOKEN:
-    raise ValueError("Missing AIRTABLE_TOKEN")
-if not AIRTABLE_BASE_ID:
-    raise ValueError("Missing AIRTABLE_BASE_ID")
+if not N8N_WEBHOOK_URL:
+    raise ValueError("Missing N8N_WEBHOOK_URL")
 
 # ========= CONFIG =========
 WISE_HEADERS = {
@@ -25,9 +20,6 @@ WISE_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
 }
-
-api = Api(AIRTABLE_TOKEN)
-table = api.table(AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME)
 
 # ========= HELPERS =========
 def log(msg: str):
@@ -88,9 +80,6 @@ def normalize_direction(amount_value) -> str:
         return "outgoing"
 
 def find_first_string(obj, candidate_keys: list[str]) -> str | None:
-    """
-    Recursively search dict/list for the first matching key with a string/number value.
-    """
     if isinstance(obj, dict):
         for key in candidate_keys:
             val = obj.get(key)
@@ -110,14 +99,15 @@ def find_first_string(obj, candidate_keys: list[str]) -> str | None:
 
     return None
 
+# ========= WISE API =========
 def get_profiles():
-    url = "https://api.wise.com/v1/profiles"
+    # using v2 based on current docs screenshot
+    url = "https://api.wise.com/v2/profiles"
     resp = requests.get(url, headers=WISE_HEADERS, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 def pick_business_profile(profiles: list[dict]) -> dict:
-    # First try to match by business name
     for profile in profiles:
         ptype = str(profile.get("type", "")).lower()
         if ptype != "business":
@@ -131,10 +121,9 @@ def pick_business_profile(profiles: list[dict]) -> dict:
             or ""
         )
 
-        if WISE_PROFILE_NAME.lower() in name.lower():
+        if WISE_PROFILE_NAME.lower() in str(name).lower():
             return profile
 
-    # Fallback: first business profile
     for profile in profiles:
         if str(profile.get("type", "")).lower() == "business":
             return profile
@@ -146,7 +135,7 @@ def get_balances(profile_id: int):
     resp = requests.get(
         url,
         headers=WISE_HEADERS,
-        params={"types": "STANDARD,SAVINGS"},
+        params={"types": "STANDARD"},
         timeout=30,
     )
     resp.raise_for_status()
@@ -165,15 +154,10 @@ def get_balance_statement(profile_id: int, balance_id: int, currency: str, start
     return resp.json()
 
 def extract_transactions(statement_json: dict) -> list[dict]:
-    """
-    Wise statement response can vary a bit.
-    Commonly transactions are under `transactions`.
-    """
     txs = statement_json.get("transactions")
     if isinstance(txs, list):
         return txs
 
-    # Fallback if response shape differs
     for key in ("statement", "data", "items"):
         maybe = statement_json.get(key)
         if isinstance(maybe, dict):
@@ -185,6 +169,7 @@ def extract_transactions(statement_json: dict) -> list[dict]:
 
     return []
 
+# ========= MAPPING =========
 def find_transfer_id(tx: dict) -> str | None:
     candidate_keys = [
         "transferId",
@@ -216,11 +201,7 @@ def find_recipient_name(tx: dict) -> str | None:
     ]
     return find_first_string(tx, candidate_keys)
 
-def build_airtable_record(tx: dict, balance_currency: str, sync_time_iso: str) -> dict | None:
-    """
-    Map Wise statement transaction -> Airtable fields
-    based on your agreed v1 schema.
-    """
+def build_n8n_payload(tx: dict, balance_currency: str, sync_time_iso: str, business_name: str) -> dict | None:
     tx_id = (
         find_first_string(tx, ["id", "transactionId", "referenceNumber", "reference"])
         or None
@@ -228,7 +209,6 @@ def build_airtable_record(tx: dict, balance_currency: str, sync_time_iso: str) -
     if not tx_id:
         return None
 
-    # Amounts
     amount_value = (
         safe_get(tx, "amount", "value")
         or tx.get("amount")
@@ -236,7 +216,6 @@ def build_airtable_record(tx: dict, balance_currency: str, sync_time_iso: str) -
         or safe_get(tx, "cashAmount", "value")
     )
 
-    # If amount is dict accidentally, try value again
     if isinstance(amount_value, dict):
         amount_value = amount_value.get("value")
 
@@ -256,6 +235,7 @@ def build_airtable_record(tx: dict, balance_currency: str, sync_time_iso: str) -
         or tx.get("createdAt")
         or tx.get("created_at")
         or tx.get("bookingDate")
+        or ""
     )
 
     raw_type = (
@@ -272,8 +252,8 @@ def build_airtable_record(tx: dict, balance_currency: str, sync_time_iso: str) -
     )
 
     transfer_id = find_transfer_id(tx)
-    sender_name = find_sender_name(tx)
-    recipient_name = find_recipient_name(tx)
+    sender_name = find_sender_name(tx) or business_name
+    recipient_name = find_recipient_name(tx) or ""
 
     reference = (
         tx.get("reference")
@@ -282,11 +262,7 @@ def build_airtable_record(tx: dict, balance_currency: str, sync_time_iso: str) -
         or ""
     )
 
-    # Basic source/target handling for v1
-    source_currency = (
-        safe_get(tx, "amount", "currency")
-        or balance_currency
-    )
+    source_currency = safe_get(tx, "amount", "currency") or balance_currency
     target_currency = balance_currency
 
     source_amount = amount_abs
@@ -303,7 +279,7 @@ def build_airtable_record(tx: dict, balance_currency: str, sync_time_iso: str) -
     except Exception:
         fee_value = 0
 
-    record = {
+    payload = {
         "Transaction ID": str(tx_id),
         "Transfer ID": str(transfer_id) if transfer_id else "",
         "Created At": created_at,
@@ -316,35 +292,33 @@ def build_airtable_record(tx: dict, balance_currency: str, sync_time_iso: str) -
         "Target Amount": target_amount,
         "Target Currency": target_currency,
         "Fee": fee_value,
-        "Sender Name": sender_name or "",
-        "Recipient Name": recipient_name or "",
+        "Sender Name": sender_name,
+        "Recipient Name": recipient_name,
         "Reference": str(reference),
+        "Receipt URL": "",
         "Last Synced": sync_time_iso,
     }
 
-    # Remove None to avoid Airtable issues
-    clean_record = {k: v for k, v in record.items() if v is not None}
-    return clean_record
+    return {k: v for k, v in payload.items() if v is not None}
 
-def find_airtable_record_id_by_transaction_id(transaction_id: str) -> str | None:
-    escaped = transaction_id.replace("'", "\\'")
-    formula = f"{{Transaction ID}}='{escaped}'"
-    results = table.all(formula=formula, max_records=1)
-    if results:
-        return results[0]["id"]
+# ========= N8N =========
+def send_to_n8n(payload: dict):
+    resp = requests.post(
+        N8N_WEBHOOK_URL,
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+    # n8n may return empty or json depending on your response node setup
+    if resp.content:
+        try:
+            return resp.json()
+        except Exception:
+            return resp.text
     return None
 
-def upsert_airtable_record(record: dict) -> str:
-    tx_id = record["Transaction ID"]
-    existing_id = find_airtable_record_id_by_transaction_id(tx_id)
-
-    if existing_id:
-        table.update(existing_id, record)
-        return "updated"
-    else:
-        table.create(record)
-        return "created"
-
+# ========= MAIN =========
 def main():
     sync_now = datetime.now(timezone.utc)
     sync_now_iso = to_iso_z(sync_now)
@@ -359,16 +333,25 @@ def main():
     profiles = get_profiles()
     profile = pick_business_profile(profiles)
     profile_id = profile["id"]
-    log(f"Using business profile ID: {profile_id}")
 
+    details = profile.get("details", {}) or {}
+    business_name = (
+        details.get("name")
+        or details.get("businessName")
+        or details.get("legalName")
+        or WISE_PROFILE_NAME
+    )
+
+    log(f"Using business profile ID: {profile_id}")
     log("Fetching balances...")
     balances = get_balances(profile_id)
+
     if not isinstance(balances, list):
         raise RuntimeError("Balances response is not a list.")
 
-    created_count = 0
-    updated_count = 0
+    sent_count = 0
     skipped_count = 0
+    failed_count = 0
 
     for balance in balances:
         balance_id = balance.get("id")
@@ -391,30 +374,28 @@ def main():
         log(f"Found {len(transactions)} transactions for {currency}")
 
         for tx in transactions:
-            record = build_airtable_record(
+            payload = build_n8n_payload(
                 tx=tx,
                 balance_currency=currency,
                 sync_time_iso=sync_now_iso,
+                business_name=business_name,
             )
 
-            if not record:
+            if not payload:
                 skipped_count += 1
                 continue
 
             try:
-                result = upsert_airtable_record(record)
-                if result == "created":
-                    created_count += 1
-                else:
-                    updated_count += 1
+                send_to_n8n(payload)
+                sent_count += 1
             except Exception as e:
-                skipped_count += 1
-                log(f"Failed to upsert transaction {record.get('Transaction ID')}: {e}")
+                failed_count += 1
+                log(f"Failed to send transaction {payload.get('Transaction ID')}: {e}")
 
     log("Sync completed.")
-    log(f"Created: {created_count}")
-    log(f"Updated: {updated_count}")
+    log(f"Sent to n8n: {sent_count}")
     log(f"Skipped: {skipped_count}")
+    log(f"Failed: {failed_count}")
 
 if __name__ == "__main__":
     try:
