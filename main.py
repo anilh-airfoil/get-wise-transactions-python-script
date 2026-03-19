@@ -282,7 +282,6 @@ def build_n8n_payload(tx: dict, balance_currency: str, sync_time_iso: str, busin
     payload = {
         "Transaction ID": str(tx_id),
         "Transfer ID": str(transfer_id) if transfer_id else "",
-        "Created At": created_at,
         "Status": normalize_status(raw_status),
         "Transaction Type": normalize_type(raw_type),
         "Direction": direction,
