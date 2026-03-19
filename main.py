@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import requests
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,9 @@ WISE_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json",
 }
+
+TRANSFER_CACHE = {}
+RECIPIENT_CACHE = {}
 
 # ========= HELPERS =========
 def log(msg: str):
@@ -45,7 +49,7 @@ def normalize_status(raw_status: str | None) -> str:
     s = raw_status.lower()
     if s in {"completed", "done", "outgoing_payment_sent"}:
         return "completed"
-    if s in {"pending", "incoming_payment_waiting", "processing", "funds_converted"}:
+    if s in {"pending", "incoming_payment_waiting", "processing", "funds_converted", "incoming_payment_initiated"}:
         return "processing"
     if s in {"cancelled", "canceled"}:
         return "cancelled"
@@ -64,12 +68,14 @@ def normalize_type(raw_type: str | None) -> str:
         return "conversion"
     if "fee" in t:
         return "fee"
-    if "deposit" in t:
+    if "deposit" in t or "money_added" in t:
         return "deposit"
     if "withdraw" in t:
         return "withdrawal"
     if "card" in t:
         return "card"
+    if "direct_debit" in t:
+        return "direct_debit"
     return "other"
 
 def normalize_direction(amount_value) -> str:
@@ -79,64 +85,59 @@ def normalize_direction(amount_value) -> str:
     except Exception:
         return "outgoing"
 
-def find_first_string(obj, candidate_keys: list[str]) -> str | None:
-    if isinstance(obj, dict):
-        for key in candidate_keys:
-            val = obj.get(key)
-            if isinstance(val, (str, int, float)) and str(val).strip():
-                return str(val).strip()
-
-        for _, value in obj.items():
-            found = find_first_string(value, candidate_keys)
-            if found:
-                return found
-
-    elif isinstance(obj, list):
-        for item in obj:
-            found = find_first_string(item, candidate_keys)
-            if found:
-                return found
-
-    return None
-
-def find_first_money_dict(obj, candidate_keys: list[str]) -> dict | None:
+def clean_iso_datetime(value: str | None) -> str:
     """
-    Recursively search for the first dict under one of the candidate keys
-    that looks like: {"value": ..., "currency": ...}
+    Return a clean ISO8601 string Airtable/n8n can parse reliably.
     """
-    if isinstance(obj, dict):
-        for key in candidate_keys:
-            val = obj.get(key)
-            if isinstance(val, dict) and ("value" in val or "amount" in val) and "currency" in val:
-                return val
+    if not value:
+        return ""
 
-        for _, value in obj.items():
-            found = find_first_money_dict(value, candidate_keys)
-            if found:
-                return found
+    text = str(value).strip()
+    if not text:
+        return ""
 
-    elif isinstance(obj, list):
-        for item in obj:
-            found = find_first_money_dict(item, candidate_keys)
-            if found:
-                return found
+    # Wise sometimes returns "2017-11-24 10:47:49"
+    if "T" not in text and " " in text:
+        try:
+            dt = datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            return to_iso_z(dt)
+        except Exception:
+            pass
 
-    return None
-
-def parse_money_dict(money_dict: dict | None) -> tuple[float | None, str | None]:
-    if not isinstance(money_dict, dict):
-        return None, None
-
-    raw_value = money_dict.get("value", money_dict.get("amount"))
-    raw_currency = money_dict.get("currency")
-
+    # Standard ISO strings, with or without Z
     try:
-        value = abs(float(raw_value)) if raw_value is not None else None
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return to_iso_z(dt)
     except Exception:
-        value = None
+        return text
 
-    currency = str(raw_currency).strip() if raw_currency else None
-    return value, currency
+def first_non_empty(*values):
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        return v
+    return None
+
+def extract_numeric_transfer_id(value: str | None) -> str | None:
+    """
+    For refs like TRANSFER-2026433794 -> 2026433794
+    """
+    if not value:
+        return None
+
+    text = str(value).strip()
+    m = re.search(r"TRANSFER-(\d+)", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    if text.isdigit():
+        return text
+
+    return None
 
 # ========= WISE API =========
 def get_profiles():
@@ -191,6 +192,44 @@ def get_balance_statement(profile_id: int, balance_id: int, currency: str, start
     resp.raise_for_status()
     return resp.json()
 
+def get_transfer_by_id(transfer_id: str) -> dict | None:
+    if not transfer_id:
+        return None
+    if transfer_id in TRANSFER_CACHE:
+        return TRANSFER_CACHE[transfer_id]
+
+    url = f"https://api.wise.com/v1/transfers/{transfer_id}"
+    resp = requests.get(url, headers=WISE_HEADERS, timeout=30)
+
+    if resp.status_code == 404:
+        TRANSFER_CACHE[transfer_id] = None
+        return None
+
+    resp.raise_for_status()
+    data = resp.json()
+    TRANSFER_CACHE[transfer_id] = data
+    return data
+
+def get_recipient_account(account_id: int | str | None) -> dict | None:
+    if not account_id:
+        return None
+
+    account_id = str(account_id)
+    if account_id in RECIPIENT_CACHE:
+        return RECIPIENT_CACHE[account_id]
+
+    url = f"https://api.wise.com/v2/accounts/{account_id}"
+    resp = requests.get(url, headers=WISE_HEADERS, timeout=30)
+
+    if resp.status_code == 404:
+        RECIPIENT_CACHE[account_id] = None
+        return None
+
+    resp.raise_for_status()
+    data = resp.json()
+    RECIPIENT_CACHE[account_id] = data
+    return data
+
 def extract_transactions(statement_json: dict) -> list[dict]:
     txs = statement_json.get("transactions")
     if isinstance(txs, list):
@@ -208,227 +247,198 @@ def extract_transactions(statement_json: dict) -> list[dict]:
     return []
 
 # ========= MAPPING =========
-def find_transfer_id(tx: dict) -> str | None:
-    direct_keys = [
-        "transferId",
-        "transfer_id",
-        "sourceTransferId",
-        "recipientTransferId",
-        "originalTransferId",
-    ]
-    found = find_first_string(tx, direct_keys)
-    if found:
-        return found
+def find_transfer_reference(tx: dict) -> str | None:
+    return first_non_empty(
+        tx.get("referenceNumber"),
+        safe_get(tx, "details", "referenceNumber"),
+        tx.get("reference"),
+        safe_get(tx, "details", "reference"),
+    )
 
-    ref = find_first_string(tx, ["referenceNumber", "reference"])
-    if ref and str(ref).upper().startswith("TRANSFER-"):
-        return str(ref)
+def find_sender_name(tx: dict, business_name: str) -> str:
+    return first_non_empty(
+        safe_get(tx, "details", "senderName"),
+        tx.get("senderName"),
+        business_name,
+    ) or business_name
+
+def find_card_or_description_name(tx: dict) -> str | None:
+    merchant_name = first_non_empty(
+        safe_get(tx, "details", "merchant", "name"),
+        safe_get(tx, "details", "merchantName"),
+    )
+    if merchant_name:
+        return str(merchant_name).strip()
+
+    description = first_non_empty(
+        safe_get(tx, "details", "description"),
+        tx.get("description"),
+    )
+    if description:
+        return str(description).strip()
 
     return None
 
-def find_sender_name(tx: dict) -> str | None:
-    candidate_keys = [
-        "senderName",
-        "payerName",
-        "sourceName",
-        "debtorName",
-        "businessName",
-    ]
-    return find_first_string(tx, candidate_keys)
+def find_clean_recipient_name_from_account(recipient_account: dict | None) -> str:
+    if not recipient_account or not isinstance(recipient_account, dict):
+        return ""
 
-def find_recipient_name(tx: dict) -> str | None:
-    candidate_keys = [
-        "recipientName",
-        "receiverName",
-        "targetName",
-        "creditorName",
-        "merchantName",
-        "counterpartyName",
-        "payeeName",
-        "displayName",
-        "name",
-        "description",
-    ]
-    found = find_first_string(tx, candidate_keys)
-    if found and not str(found).strip().upper().startswith(("CARD-", "TRANSFER-")):
-        return found
-    return None
+    return str(first_non_empty(
+        safe_get(recipient_account, "name", "fullName"),
+        recipient_account.get("accountHolderName"),
+        recipient_account.get("name"),
+    ) or "").strip()
 
-def is_transfer_like(tx: dict, raw_type: str | None = None, tx_id: str | None = None, reference: str | None = None) -> bool:
-    type_value = (raw_type or "").lower()
-    if "transfer" in type_value:
-        return True
-
-    if tx_id and str(tx_id).upper().startswith("TRANSFER-"):
-        return True
-
-    if reference and str(reference).upper().startswith("TRANSFER-"):
-        return True
-
-    if find_transfer_id(tx):
-        return True
-
-    return False
-
-def enrich_transfer_details_stub(
+def build_n8n_payload(
     tx: dict,
-    transfer_id: str | None,
-    recipient_name: str | None,
-    sender_name: str | None,
-    reference: str | None,
-) -> dict:
-    """
-    Phase 1.5 helper:
-    No extra Wise API call yet.
-    Just centralizes enrichment logic so phase 2 can plug in here later.
-    """
-    enriched = {
-        "transfer_id": transfer_id or "",
-        "recipient_name": recipient_name or "",
-        "sender_name": sender_name or "",
-        "reference": reference or "",
-        "receipt_url": "",
-    }
+    balance_currency: str,
+    sync_time_iso: str,
+    business_name: str,
+) -> dict | None:
+    # Statement fields per Wise docs
+    tx_date = clean_iso_datetime(tx.get("date"))
+    tx_amount_value = safe_get(tx, "amount", "value")
+    tx_amount_currency = safe_get(tx, "amount", "currency") or balance_currency
+    tx_fee_value = safe_get(tx, "totalFees", "value")
+    tx_details = tx.get("details", {}) or {}
+    tx_exchange_details = tx.get("exchangeDetails", {}) or {}
 
-    if not enriched["transfer_id"]:
-        ref = find_first_string(tx, ["referenceNumber", "reference"])
-        if ref and str(ref).upper().startswith("TRANSFER-"):
-            enriched["transfer_id"] = str(ref)
-
-    if not enriched["recipient_name"]:
-        alt_name = find_first_string(
-            tx,
-            [
-                "merchantName",
-                "counterpartyName",
-                "payeeName",
-                "displayName",
-            ],
-        )
-        if alt_name and not str(alt_name).strip().upper().startswith(("CARD-", "TRANSFER-")):
-            enriched["recipient_name"] = alt_name
-
-    return enriched
-
-def build_n8n_payload(tx: dict, balance_currency: str, sync_time_iso: str, business_name: str) -> dict | None:
-    tx_id = (
-        find_first_string(tx, ["referenceNumber", "transactionId", "id", "reference"])
-        or None
-    )
-    if not tx_id:
-        return None
-
-    amount_value = (
-        safe_get(tx, "amount", "value")
-        or tx.get("amount")
-        or safe_get(tx, "totalAmount", "value")
-        or safe_get(tx, "cashAmount", "value")
-    )
-
-    if isinstance(amount_value, dict):
-        amount_value = amount_value.get("value")
-
-    if amount_value is None:
+    if tx_amount_value is None:
         return None
 
     try:
-        amount_float = float(amount_value)
+        amount_float = float(tx_amount_value)
     except Exception:
         return None
 
     amount_abs = abs(amount_float)
     direction = normalize_direction(amount_float)
 
-    transaction_on = (
-        tx.get("date")
-        or tx.get("createdAt")
-        or tx.get("created_at")
-        or tx.get("bookingDate")
-        or ""
+    raw_type = first_non_empty(
+        safe_get(tx, "details", "type"),
+        tx.get("type"),
+        tx.get("transactionType"),
+        tx.get("detailsType"),
+        "other",
     )
 
-    raw_type = (
-        tx.get("type")
-        or tx.get("transactionType")
-        or tx.get("detailsType")
-        or "other"
+    raw_status = first_non_empty(
+        tx.get("status"),
+        tx.get("state"),
+        "completed",
     )
 
-    raw_status = (
-        tx.get("status")
-        or tx.get("state")
-        or "completed"
-    )
+    reference = str(first_non_empty(
+        safe_get(tx, "details", "paymentReference"),
+        safe_get(tx, "details", "description"),
+        tx.get("referenceNumber"),
+        tx.get("reference"),
+        ""
+    ))
 
-    reference = (
-        tx.get("reference")
-        or tx.get("referenceNumber")
-        or tx.get("description")
-        or ""
-    )
+    transaction_id = str(first_non_empty(
+        tx.get("referenceNumber"),
+        tx.get("id"),
+        reference,
+    ) or "")
 
-    transfer_id = find_transfer_id(tx)
-    sender_name = find_sender_name(tx) or business_name
-    recipient_name = find_recipient_name(tx) or ""
+    if not transaction_id:
+        return None
 
-    if is_transfer_like(tx, raw_type=raw_type, tx_id=str(tx_id), reference=str(reference)):
-        enriched = enrich_transfer_details_stub(
-            tx=tx,
-            transfer_id=transfer_id,
-            recipient_name=recipient_name,
-            sender_name=sender_name,
-            reference=str(reference),
-        )
-        transfer_id = enriched["transfer_id"]
-        recipient_name = enriched["recipient_name"]
-        sender_name = enriched["sender_name"]
-        reference = enriched["reference"]
-        receipt_url = enriched["receipt_url"]
-    else:
-        receipt_url = ""
-
-    # Source side
-    source_currency = safe_get(tx, "amount", "currency") or balance_currency
     source_amount = amount_abs
+    source_currency = tx_amount_currency
 
-    # Try to detect target/recipient side separately
-    target_money_dict = find_first_money_dict(
-        tx,
-        [
-            "targetAmount",
-            "recipientAmount",
-            "payoutAmount",
-            "convertedAmount",
-            "destinationAmount",
-            "settlementAmount",
-        ],
-    )
+    target_amount = None
+    target_currency = None
 
-    target_amount, target_currency = parse_money_dict(target_money_dict)
+    sender_name = find_sender_name(tx, business_name)
+    recipient_name = ""
 
-    # Fallback if no separate target amount was found
+    # ===== Transfer enrichment =====
+    transfer_numeric_id = extract_numeric_transfer_id(transaction_id) or extract_numeric_transfer_id(reference)
+    transfer_obj = None
+
+    if normalize_type(str(raw_type)) == "transfer" and transfer_numeric_id:
+        try:
+            transfer_obj = get_transfer_by_id(transfer_numeric_id)
+        except Exception as e:
+            log(f"Could not fetch transfer {transfer_numeric_id}: {e}")
+
+    if transfer_obj:
+        # Transfer object is the best source for transfer amounts/currencies
+        source_amount = first_non_empty(transfer_obj.get("sourceValue"), source_amount)
+        source_currency = first_non_empty(transfer_obj.get("sourceCurrency"), source_currency)
+        target_amount = first_non_empty(transfer_obj.get("targetValue"), target_amount)
+        target_currency = first_non_empty(transfer_obj.get("targetCurrency"), target_currency)
+
+        # Better status and created timestamp if present
+        raw_status = first_non_empty(transfer_obj.get("status"), raw_status)
+        tx_date = clean_iso_datetime(first_non_empty(transfer_obj.get("created"), tx_date))
+
+        target_account = transfer_obj.get("targetAccount")
+        if target_account:
+            try:
+                recipient_account = get_recipient_account(target_account)
+                recipient_name = find_clean_recipient_name_from_account(recipient_account)
+            except Exception as e:
+                log(f"Could not fetch recipient account {target_account}: {e}")
+
+    # ===== Conversion fallback from balance statement =====
     if target_amount is None:
-        target_amount = amount_abs
+        target_amount = first_non_empty(
+            safe_get(tx_details, "targetAmount", "value"),
+            safe_get(tx_exchange_details, "forAmount", "value"),
+        )
 
     if not target_currency:
-        target_currency = balance_currency
+        target_currency = first_non_empty(
+            safe_get(tx_details, "targetAmount", "currency"),
+            safe_get(tx_exchange_details, "forAmount", "currency"),
+        )
 
-    fee_value = (
-        safe_get(tx, "fee", "value")
-        or safe_get(tx, "totalFees", "value")
-        or tx.get("fee")
-        or 0
-    )
+    # ===== Card / non-transfer recipient fallback =====
+    if not recipient_name:
+        recipient_name = find_card_or_description_name(tx) or ""
+
+        # Clean common noisy transfer descriptions
+        if recipient_name.lower().startswith("sent money to "):
+            recipient_name = recipient_name[14:].strip()
+        elif recipient_name.lower().startswith("received money from "):
+            recipient_name = recipient_name[20:].strip()
+
+    # ===== Final sane fallbacks =====
+    if source_amount is not None:
+        try:
+            source_amount = abs(float(source_amount))
+        except Exception:
+            source_amount = amount_abs
+    else:
+        source_amount = amount_abs
+
+    if target_amount is not None:
+        try:
+            target_amount = abs(float(target_amount))
+        except Exception:
+            target_amount = source_amount
+    else:
+        target_amount = source_amount
+
+    if not source_currency:
+        source_currency = balance_currency
+
+    if not target_currency:
+        target_currency = source_currency
+
     try:
-        fee_value = abs(float(fee_value)) if fee_value is not None else 0
+        fee_value = abs(float(tx_fee_value)) if tx_fee_value is not None else 0
     except Exception:
         fee_value = 0
 
     payload = {
-        "Transaction ID": str(tx_id),
-        "Transaction On": transaction_on,
-        "Status": normalize_status(raw_status),
-        "Transaction Type": normalize_type(raw_type),
+        "Transaction ID": transaction_id,
+        "Transaction On": tx_date,
+        "Status": normalize_status(str(raw_status)),
+        "Transaction Type": normalize_type(str(raw_type)),
         "Direction": direction,
         "Amount": amount_abs,
         "Source Amount": source_amount,
@@ -438,8 +448,7 @@ def build_n8n_payload(tx: dict, balance_currency: str, sync_time_iso: str, busin
         "Fee": fee_value,
         "Sender Name": sender_name or "",
         "Recipient Name": recipient_name or "",
-        "Reference": str(reference) if reference else "",
-        "Receipt URL": receipt_url,
+        "Reference": reference,
         "Last Synced": sync_time_iso,
     }
 
@@ -527,18 +536,6 @@ def main():
             if not payload:
                 skipped_count += 1
                 continue
-
-            # Optional debug log for transfer-like rows
-            if str(payload.get("Transaction ID", "")).upper().startswith("TRANSFER-"):
-                log(f"TRANSFER RAW TX: {tx}")
-
-            if not payload.get("Transfer ID") or not payload.get("Recipient Name"):
-                log(
-                    f"Missing details | TX={payload.get('Transaction ID')} "
-                    f"| Type={payload.get('Transaction Type')} "
-                    f"| Direction={payload.get('Direction')} "
-                    f"| Ref={payload.get('Reference')}"
-                )
 
             try:
                 send_to_n8n(payload)
