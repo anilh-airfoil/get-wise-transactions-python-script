@@ -142,12 +142,10 @@ def pick_business_profile(profiles: list[dict]) -> dict:
     raise RuntimeError("No business profile found in Wise account.")
 
 def get_balances(profile_id: int):
-    # v4 balances endpoint
-    url = "https://api.wise.com/v4/balances"
+    url = f"https://api.wise.com/v4/profiles/{profile_id}/balances"
     resp = requests.get(
         url,
         headers=WISE_HEADERS,
-        params={"profileId": profile_id},
         timeout=30,
     )
     resp.raise_for_status()
